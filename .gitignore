@@ -1,0 +1,8 @@
+build/
+install/
+*.o
+*.map
+*.lst
+.vscode/
+CLAUDE.local.md
+dist/

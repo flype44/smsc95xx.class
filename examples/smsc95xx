@@ -1,0 +1,6 @@
+; Roadshow interface file for smsc95xx.device (SMSC LAN95xx USB Ethernet, e.g. the
+; network port of a Raspberry Pi 3B). Copy it to DEVS:NetInterfaces/smsc95xx and run
+; "AddNetInterface smsc95xx" after Poseidon has bound the Ethernet controller.
+DEVICE=smsc95xx.device
+UNIT=0
+CONFIGURE=DHCP
