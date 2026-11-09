@@ -19,7 +19,7 @@ BUILD   := build
 SANA_INC ?= $(PREFIX)/m68k-amigaos/ndk-include
 
 VERSION  := 0
-REVISION := 10
+REVISION := 17
 DATE     := $(shell date +%d.%m.%Y)
 
 # -m68040 / -msoft-float: Emu68 is the only target, and its FPU is partial, so

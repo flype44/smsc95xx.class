@@ -2,14 +2,13 @@
 /*
  * data.c - bulk data path of the LAN95xx: endpoints, pipes, receive, transmit.
  *
- * Framing used (one Ethernet frame per bulk transfer, no burst mode):
+ * Framing (LAN950x data sheet DS00001875D, 5.3 and 5.4):
  *
- *   RX bulk-in : [ RX status, 4 bytes LE ][ frame, FCS included ]
- *   TX bulk-out: [ TX cmd A, 4 bytes LE ][ TX cmd B, 4 bytes LE ][ frame ]
+ *   RX bulk-in : one or more [ RX status, 4 bytes LE ][ frame + FCS ][ pad to 4 ]
+ *   TX bulk-out: one or more [ TX cmd A ][ TX cmd B ][ frame ][ pad to 4 ],
+ *                the last frame without its padding
  *
  * The functions here run in the binding's task only; they are not re-entrant.
- * Milestone 4: received frames are only counted and a few are logged; there
- * is no SANA-II delivery yet.
  */
 
 #include <exec/types.h>
@@ -67,7 +66,7 @@ BOOL data_open(struct Smsc95xxBinding *b)
     }
 
     b->buffers = AllocVec((ULONG)LAN95_RX_QUEUE * LAN95_RX_BUF_SIZE +
-                          LAN95_BUF_SIZE, MEMF_PUBLIC | MEMF_CLEAR);
+                          LAN95_TX_BUF_SIZE, MEMF_PUBLIC | MEMF_CLEAR);
     if (!b->buffers) {
         smsc_log(ps, PSD_MSG_FAIL, "Out of memory (data buffers).", args);
         return FALSE;
@@ -75,6 +74,8 @@ BOOL data_open(struct Smsc95xxBinding *b)
     for (i = 0; i < LAN95_RX_QUEUE; i++)
         b->rx_buf[i] = b->buffers + (ULONG)i * LAN95_RX_BUF_SIZE;
     b->tx_buf = b->buffers + (ULONG)LAN95_RX_QUEUE * LAN95_RX_BUF_SIZE;
+    b->tx_fill = b->tx_end = 0;
+    b->tx_count = b->tx_wire_count = 0;
     b->rx_len = b->multi ? LAN95_RX_BUF_SIZE : LAN95_BUF_SIZE;
 
     /* Receive pipes wait for ever and accept short packets. */
@@ -155,44 +156,71 @@ void data_close(struct Smsc95xxBinding *b)
 /* ------------------------------------------------------------------ */
 
 /*
- * Transmit in two steps, so the caller builds the frame straight into the
- * buffer: data_tx_frame() returns where the frame goes (or NULL while the
- * previous transfer is still on the wire), data_tx_commit() sends 'len' bytes.
+ * The caller builds each frame straight into the transmit buffer, then the
+ * whole batch leaves in one bulk-out transfer:
+ *
+ *   data_tx_slot()   where the next frame goes (room for a full-size frame),
+ *                    or NULL while a transfer is in flight or the batch is full
+ *   data_tx_add()    the frame just built there is 'len' bytes long
+ *   data_tx_flush()  send what was packed
+ *
+ * Each frame is one buffer (first and last segment) and the next one starts
+ * on a 4-byte boundary (data sheet 5.4.2, figure 5-5). The transfer stops at
+ * the end of the last frame: padding after it would be read as the TX
+ * command A of a frame that does not exist, a TX error the chip only leaves
+ * after a reset (5.4.2.5).
  */
-UBYTE *data_tx_frame(struct Smsc95xxBinding *b)
+UBYTE *data_tx_slot(struct Smsc95xxBinding *b)
 {
-    if (!b->running || b->tx_busy)
+    if (!b->running || b->tx_busy || b->tx_count >= LAN95_TX_BATCH_MAX ||
+        b->tx_fill + LAN95_TX_HDR_SIZE + ETH_RAW_MTU > LAN95_TX_BUF_SIZE)
         return NULL;
-    return b->tx_buf + LAN95_TX_HDR_SIZE;
+    return b->tx_buf + b->tx_fill + LAN95_TX_HDR_SIZE;
 }
 
-BOOL data_tx_commit(struct Smsc95xxBinding *b, ULONG len)
+BOOL data_tx_add(struct Smsc95xxBinding *b, ULONG len)
 {
-    if (!b->running || b->tx_busy || len == 0 ||
-        len + LAN95_TX_HDR_SIZE > LAN95_BUF_SIZE)
+    UBYTE *hdr = b->tx_buf + b->tx_fill;
+
+    if (!data_tx_slot(b) || len == 0 || len > ETH_RAW_MTU)
         return FALSE;
 
-    le32_put(b->tx_buf, LAN95_TX_A_FIRST_SEG | LAN95_TX_A_LAST_SEG |
-                        (len & LAN95_TX_LEN_MASK));
-    le32_put(b->tx_buf + 4, len & LAN95_TX_LEN_MASK);
+    le32_put(hdr, LAN95_TX_A_FIRST_SEG | LAN95_TX_A_LAST_SEG |
+                  (len & LAN95_TX_LEN_MASK));
+    le32_put(hdr + 4, len & LAN95_TX_LEN_MASK);
 
-    b->tx_busy = TRUE;
-    psdSendPipe(b->ps, b->tx_pipe, b->tx_buf, len + LAN95_TX_HDR_SIZE);
+    b->tx_end = b->tx_fill + LAN95_TX_HDR_SIZE + len;
+    b->tx_fill = (b->tx_end + 3) & ~3UL;
+    b->tx_count++;
     return TRUE;
 }
 
-/* Queue one frame. Returns FALSE if the transmitter is busy or the frame does
- * not fit. The frame is copied; the caller's buffer is free on return. */
+BOOL data_tx_flush(struct Smsc95xxBinding *b)
+{
+    if (!b->running || b->tx_busy || b->tx_count == 0)
+        return FALSE;
+
+    b->tx_busy = TRUE;
+    b->tx_wire_count = b->tx_count;
+    psdSendPipe(b->ps, b->tx_pipe, b->tx_buf, b->tx_end);
+    b->tx_fill = b->tx_end = 0;
+    b->tx_count = 0;
+    return TRUE;
+}
+
+/* Send one frame on its own (the self-test). Returns FALSE if the transmitter
+ * is busy or the frame does not fit. The frame is copied; the caller's buffer
+ * is free on return. */
 BOOL data_send(struct Smsc95xxBinding *b, const UBYTE *frame, ULONG len)
 {
-    UBYTE *dst = data_tx_frame(b);
+    UBYTE *dst;
     ULONG i;
 
-    if (!dst || len == 0 || len + LAN95_TX_HDR_SIZE > LAN95_BUF_SIZE)
+    if (b->tx_count || !(dst = data_tx_slot(b)) || len == 0 || len > ETH_RAW_MTU)
         return FALSE;
     for (i = 0; i < len; i++)
         dst[i] = frame[i];
-    return data_tx_commit(b, len);
+    return data_tx_add(b, len) && data_tx_flush(b);
 }
 
 /*
@@ -308,10 +336,13 @@ static void tx_done(struct Smsc95xxBinding *b)
     if (err) {
         b->tx_errors++;
         args[0] = (ULONG)err;
-        smsc_log(b->ps, PSD_MSG_WARN, "Transmit error %ld.", args);
+        args[1] = b->tx_wire_count;
+        smsc_log(b->ps, PSD_MSG_WARN, "Transmit error %ld (%ld frames lost).", args);
     } else {
-        b->tx_frames++;
+        b->tx_frames += b->tx_wire_count;
+        b->tx_xfers++;
     }
+    b->tx_wire_count = 0;
     if (b->unit)
         sana_tx_done(b->unit, err);
 }

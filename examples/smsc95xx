@@ -4,3 +4,12 @@
 DEVICE=smsc95xx.device
 UNIT=0
 CONFIGURE=DHCP
+
+; Roadshow's defaults (32 read and 32 write requests) are too few for this device:
+; a receive burst uses up to about 50 read requests, and the write queue fills up.
+; REQUIRESINITDELAY and COPYMODE=SLOW are workarounds for the Ariadne card only.
+IPREQUESTS=128
+WRITEREQUESTS=128
+ARPREQUESTS=8
+REQUIRESINITDELAY=NO
+COPYMODE=FAST

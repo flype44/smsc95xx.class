@@ -157,6 +157,30 @@ static BOOL env_flag(const char *name)
     return GetVar((CONST_STRPTR)name, buf, sizeof(buf), GVF_GLOBAL_ONLY) >= 0;
 }
 
+/* Read the global variable ENV:<name> as a decimal number ("136", "-1").
+ * FALSE if it is not set or is not a number (then *val is left alone). */
+static BOOL env_number(const char *name, LONG *val)
+{
+    UBYTE buf[12];
+    LONG n, i = 0, v = 0;
+    BOOL neg = FALSE;
+
+    n = GetVar((CONST_STRPTR)name, buf, sizeof(buf), GVF_GLOBAL_ONLY);
+    if (n > 0 && buf[0] == '-') {
+        neg = TRUE;
+        i = 1;
+    }
+    if (n <= i)
+        return FALSE;
+    for (; i < n; i++) {
+        if (buf[i] < '0' || buf[i] > '9' || v > 99999)
+            return FALSE;
+        v = v * 10 + (LONG)(buf[i] - '0');
+    }
+    *val = neg ? -v : v;
+    return TRUE;
+}
+
 static BOOL bring_up_chip(struct Smsc95xxBinding *b)
 {
     ULONG idrev;
@@ -196,6 +220,22 @@ static BOOL bring_up_chip(struct Smsc95xxBinding *b)
     args[1] = (ULONG)(b->no_bir ? "off" : "on");
     smsc_log(b->ps, PSD_MSG_INFO, "Receive mode: %s, bulk-in empty response %s.", args);
 
+    /* ENV:smsc95xx.bulkindly: the bulk-in delay in microseconds, instead of
+     * LAN95_BULK_IN_DLY_DEFAULT (136 us). For measurements. */
+    b->bulk_in_dly = LAN95_BULK_IN_DLY_DEFAULT;
+    {
+        LONG us;
+
+        if (env_number("smsc95xx.bulkindly", &us) && us >= 0) {
+            b->bulk_in_dly = (ULONG)us * LAN95_BULK_IN_DLY_PER_US;
+            if (b->bulk_in_dly > LAN95_BULK_IN_DLY_MAX)
+                b->bulk_in_dly = LAN95_BULK_IN_DLY_MAX;
+        }
+    }
+    args[0] = b->bulk_in_dly / LAN95_BULK_IN_DLY_PER_US;
+    args[1] = b->bulk_in_dly;
+    smsc_log(b->ps, PSD_MSG_INFO, "Bulk-in delay %ld us (0x%lx).", args);
+
     step = lan95_chip_init(b);
     if (step) {
         args[0] = step;
@@ -228,7 +268,8 @@ static BOOL bring_up_chip(struct Smsc95xxBinding *b)
 /* Timer, link and statistics                                          */
 /* ------------------------------------------------------------------ */
 
-#define LINK_POLL_MS        500
+#define LINK_POLL_MS        500         /* the tick of the binding task  */
+#define LINK_IDLE_TICKS     2           /* link up, no traffic: poll every 1 s */
 #define STATS_EVERY_TICKS   120         /* x LINK_POLL_MS = 60 s */
 #define SELFTEST_AFTER_TICKS 4
 
@@ -296,8 +337,22 @@ static void link_tick(struct Smsc95xxBinding *b)
     ULONG ms;
     BOOL ok;
 
-    /* The task serves RX, TX and SANA-II requests only between two steps of
-     * this poll, so how long it takes is what the traffic waits for. */
+    /*
+     * The task serves RX, TX and SANA-II requests only between two steps of
+     * this poll (each MII read is several control transfers), so it is done
+     * only when needed: a frame received since the last tick proves the link
+     * is up, and with the link up and no traffic, once a second is enough
+     * (lan78xx.class polls at that rate). While the link is down, every tick.
+     */
+    if (b->link_up) {
+        if (b->rx_frames != b->link_rx_seen) {
+            b->link_rx_seen = b->rx_frames;
+            return;
+        }
+        if (b->ticks % LINK_IDLE_TICKS)
+            return;
+    }
+
     timer_now(b, &t0);
     ok = lan95_link_update(b);
     timer_now(b, &t1);
@@ -335,7 +390,7 @@ static void link_tick(struct Smsc95xxBinding *b)
 
 static void stats_log(struct Smsc95xxBinding *b, BOOL force)
 {
-    ULONG args[6];
+    ULONG args[7];
 
     if (!force && b->stat_rx == b->rx_frames && b->stat_tx == b->tx_frames &&
         b->stat_err == b->rx_errors + b->tx_errors)
@@ -348,10 +403,11 @@ static void stats_log(struct Smsc95xxBinding *b, BOOL force)
     args[1] = b->rx_bytes;
     args[2] = b->rx_errors;
     args[3] = b->tx_frames;
-    args[4] = b->tx_errors;
-    args[5] = b->rx_empty;
+    args[4] = b->tx_xfers;
+    args[5] = b->tx_errors;
+    args[6] = b->rx_empty;
     smsc_log(b->ps, PSD_MSG_INFO,
-             "Stats: RX %ld frames (%ld bytes, %ld errors), TX %ld frames (%ld errors), %ld empty reads.",
+             "Stats: RX %ld frames (%ld bytes, %ld errors), TX %ld frames in %ld transfers (%ld errors), %ld empty reads.",
              args);
 }
 
@@ -387,6 +443,41 @@ static void selftest_read(struct Smsc95xxBinding *b)
         b->selftest_ip = ip;
         b->selftest_wanted = TRUE;
     }
+}
+
+/*
+ * Priority of the binding task while it serves the network: TASKPRI_DEFAULT,
+ * the priority of the TCP/IP stack's own task (Roadshow runs at 0). At the
+ * same priority, a CMD_WRITE posted by the stack does not pre-empt it: the
+ * stack keeps the CPU until it waits, so its writes pile up and leave together
+ * in one bulk-out transfer. Above it (Poseidon's sub-task priority, 5), the
+ * task woke for every write and sent the frames one by one: half the transmit
+ * rate. Below it (-1), transmit was as fast but the bulk-in transfer was
+ * re-armed late and receive suffered; any busy program at 0 would also stop
+ * the network. Measured on a Pi 3B, see README.md.
+ *
+ * The global variable ENV:smsc95xx.taskpri ("10", "-1") overrides it, held
+ * between TASKPRI_MIN and TASKPRI_MAX (below input.device and dwc2usb.device,
+ * 20 and 21).
+ */
+#define TASKPRI_DEFAULT 0
+#define TASKPRI_MIN     (-5)
+#define TASKPRI_MAX     19
+
+static void taskpri_apply(struct Smsc95xxBinding *b)
+{
+    LONG pri = TASKPRI_DEFAULT;
+    BOOL from_env = env_number("smsc95xx.taskpri", &pri);
+    ULONG args[3];
+
+    if (pri < TASKPRI_MIN)
+        pri = TASKPRI_MIN;
+    if (pri > TASKPRI_MAX)
+        pri = TASKPRI_MAX;
+    args[0] = (ULONG)(LONG)SetTaskPri(FindTask(NULL), pri);
+    args[1] = (ULONG)pri;
+    args[2] = (ULONG)(from_env ? " (ENV:smsc95xx.taskpri)" : "");
+    smsc_log(b->ps, PSD_MSG_INFO, "Task priority %ld -> %ld%s.", args);
 }
 
 static void selftest_tick(struct Smsc95xxBinding *b)
@@ -469,6 +560,7 @@ static void run_data_path(struct Smsc95xxBinding *b)
     args[0] = b->unit->number;
     smsc_log(b->ps, PSD_MSG_INFO,
              "Receiver and transmitter running; smsc95xx.device unit %ld.", args);
+    taskpri_apply(b);
     run_loop(b);
     sana_unit_detach(b->unit);
     stats_log(b, TRUE);

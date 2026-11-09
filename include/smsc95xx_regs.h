@@ -142,7 +142,12 @@
 #define LAN95_AFC_CFG_DEFAULT   0x00F830A1UL
 #define LAN95_AFC_CFG_BACKPRESSURE 0xFUL    /* half duplex: back pressure */
 
+/* BULK_IN_DLY counts units of 16.667 ns (60 per microsecond): how long the
+ * chip waits for more frames before it ends a bulk-in burst with a short
+ * packet. 0x2000 = 136.5 us (the chip's reset value is 0x800 = 34.1 us). */
 #define LAN95_BULK_IN_DLY_DEFAULT 0x00002000UL
+#define LAN95_BULK_IN_DLY_PER_US  60UL
+#define LAN95_BULK_IN_DLY_MAX     0x0000FFFFUL
 
 /* ------------------------------------------------------------------ */
 /* Internal PHY (MII address 1) - generic IEEE 802.3 registers         */

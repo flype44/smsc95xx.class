@@ -49,15 +49,22 @@ initialises it, opens the bulk pipes, enables the MAC, attaches the SANA-II unit
 its event loop. Everything that touches the chip happens in that task: no locking is needed
 for the hardware state.
 
+Before its event loop the task sets its own priority to 0, the priority of the TCP/IP stack
+(`ENV:smsc95xx.taskpri` overrides it). At the same priority a write posted by the stack does
+not pre-empt the stack, so writes pile up and leave in one transfer; at Poseidon's sub-task
+priority (5) the task took every write as it came and sent the frames one by one.
+
 ## Chip bring-up (`lan95.c`)
 
 1. Read `ID_REV`.
 2. Take the station address from the platform (the Pi 3 has no EEPROM).
 3. Lite reset, PHY reset, set the MAC address, receive format (multi-frame or single-frame),
    bulk-in delay, LEDs, flow control, no checksum offload.
-4. Start auto-negotiation. The link is polled every 500 ms with **one** MII read in the steady
-   state (each MII access costs several control transfers, and the task also serves the
-   network); speed and duplex are resolved only when the link comes up or has bounced.
+4. Start auto-negotiation. The link is polled with **one** MII read in the steady state (each
+   MII access costs several control transfers, during which the task serves no traffic): not at
+   all while frames arrive (they prove the link is up), once a second when the link is up and
+   idle, every 500 ms while it is down. Speed and duplex are resolved only when the link comes
+   up or has bounced.
 
 ## Data path (`data.c`)
 
@@ -65,8 +72,13 @@ for the hardware state.
   carries several frames, each as `[status word][frame + FCS][padding to 4]`; the parser walks
   the transfer and drops frames that carry an error flag, a bad length, or that lose
   synchronisation. The FCS is removed before delivery.
-- **Transmit:** one transfer at a time, `[cmd A][cmd B][frame]`; the frame is built straight in
-  the transmit buffer by `sana.c`.
+- **Transmit:** the writes waiting when the pipe is free leave together in one bulk-out transfer
+  (up to `LAN95_TX_BATCH_MAX` frames in a 16 KiB buffer), each as `[cmd A][cmd B][frame]`, the next
+  one on a 4-byte boundary; the transfer ends with the last frame, unpadded. The chip always accepts
+  several frames per transfer (LAN950x data sheet DS00001875D, 5.3.1.2 and 5.4.2). Frames are built
+  straight in the transmit buffer by `sana.c`; their requests are replied when the transfer completes.
+  Only **one** transfer is in flight: dwc2usb does not serialise the transfers of one endpoint, so
+  two could leave out of order or on both bulk channels at once.
 
 ### Why only one bulk-in is pending
 

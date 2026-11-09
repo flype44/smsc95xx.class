@@ -9,7 +9,7 @@ no network driver for it on AmigaOS. `smsc95xx.class` is a class for the Poseido
 that binds to the LAN95xx and provides `smsc95xx.device`, a SANA-II network device that
 Roadshow (and any other SANA-II stack) can use.
 
-> **Status: work in progress (version 0.10).** It works and is stable in the tests done so
+> **Status: work in progress (version 0.17).** It works and is stable in the tests done so
 > far (DHCP, ping, large downloads and uploads, a USB stick on the same hub), but it is young:
 > it has been tested on one machine only, see [Status and limits](#status-and-limits).
 
@@ -39,24 +39,44 @@ tested.
   station address, multicast addresses and ranges (hardware hash filter), promiscuous mode,
   packet type tracking and statistics, events, orphan reads, online/offline, flush, abort.
 - Receive of several frames per USB transfer (the chip's multi-frame mode).
+- Transmit of several frames per USB transfer: the writes waiting when the transmitter is free
+  leave together (up to 16 frames, 4.5 per transfer on average during an upload).
 - A unit that survives a restart of Poseidon, so a running TCP/IP stack is not left with a
   dangling device; requests fail at once while the USB device is gone.
 
 ## Performance
 
-Measured on the setup above (one machine, indicative, not a benchmark):
+Measured on the setup above (one machine, indicative, not a benchmark), with the Roadshow
+interface file of [`examples/smsc95xx`](examples/smsc95xx):
 
-| | |
-|---|---|
-| Download (AmiSpeedTest) | about 3.2 to 3.6 MB/s (26 to 28 Mbit/s) |
-| Upload (AmiSpeedTest) | about 1.4 MB/s (11 Mbit/s) |
-| Ping on the local network | about 2 to 4 ms, no loss |
-| Large transfers, SHA-256 verified | identical |
+| | 0.10 | 0.17 |
+|---|---|---|
+| Download (AmiSpeedTest) | 3.5 MB/s | **5.2 to 5.5 MB/s** (about 43 Mbit/s) |
+| Upload (AmiSpeedTest) | 1.3 MB/s | **3.6 to 4.2 MB/s** (about 31 Mbit/s) |
+| 1 MiB file from the PC to the Amiga (rxnet) | 0.7 to 2.1 MB/s | 1.7 to 2.8 MB/s |
+| 1 MiB file from the Amiga to the PC (rxnet) | 1.3 MB/s | 2.1 to 2.9 MB/s |
+| Driver task during an upload | 21 % CPU, 2900 task switches/s | 10 % CPU, 750 task switches/s |
+| Ping on the local network | about 4 ms | about 6 ms, no loss |
+| Large transfers, compared byte for byte | identical | identical |
 
 A 100 Mbit/s link carries about 12 MB/s: the limits are the emulated 68k, the TCP/IP stack
-and the USB path, not the chip. Upload is the weaker direction (one frame per USB transfer).
+and the USB path, not the chip. During a transfer the whole machine is busy (about 70 %), and
+the USB host controller driver takes more of it than this driver.
 
-![AmiSpeedTest running on the Raspberry Pi 3B through smsc95xx.device: average download 3218 kB/s, average upload 1387 kB/s](docs/images/amispeedtest.png)
+What made the difference, from 0.10 to 0.17:
+
+- **Roadshow's buffers.** With its defaults (32 read and 32 write requests) the write queue was
+  always full and receive was irregular: see the interface file.
+- **Several frames per transmit transfer.** The chip accepts them (LAN950x data sheet
+  DS00001875D, 5.3.1.2); only one transfer is in flight, the next one takes every write queued
+  meanwhile.
+- **The task priority.** The driver's task runs at the priority of the TCP/IP stack (0). At
+  Poseidon's usual 5 it pre-empted Roadshow on every write and sent the frames one by one, so
+  the batches above never formed: upload stayed at 1.3 MB/s.
+- **The link poll.** Reading the PHY costs several USB control transfers during which the task
+  serves no traffic; it is now skipped while frames arrive, and done once a second otherwise.
+
+![AmiSpeedTest running on the Raspberry Pi 3B through smsc95xx.device 0.17: average download 5471 kB/s, average upload 4234 kB/s](docs/images/amispeedtest.png)
 
 ## Requirements
 
@@ -90,7 +110,14 @@ and the USB path, not the chip. Upload is the weaker direction (one frame per US
    DEVICE=smsc95xx.device
    UNIT=0
    CONFIGURE=DHCP
+   IPREQUESTS=128
+   WRITEREQUESTS=128
+   ARPREQUESTS=8
+   REQUIRESINITDELAY=NO
+   COPYMODE=FAST
    ```
+   The last five lines matter for speed: Roadshow's default of 32 requests each way is too
+   few for this device.
 5. Run `AddNetInterface smsc95xx`.
 
 There is **no file** to put in `DEVS:Networks/`: like the other Poseidon network classes, the
@@ -109,23 +136,27 @@ variable to go back to the default):
 | `smsc95xx.selftest` | An IPv4 address (`192.168.1.254`): one ARP probe (RFC 5227, sender 0.0.0.0) is sent for it a few seconds after the link is up, to exercise transmit and receive without a TCP/IP stack. Nothing is sent without this variable. |
 | `smsc95xx.single` | Any value: one Ethernet frame per USB receive transfer instead of the multi-frame mode. A fallback if the multi-frame mode misbehaves. |
 | `smsc95xx.nobir` | Any value: does not set the chip's "bulk-in empty response" bit. For experiments. |
+| `smsc95xx.bulkindly` | A number of microseconds: how long the chip waits for more frames before it ends a receive transfer, instead of 136 (the chip's own default, 34, gave a slower download; 300 was no better than 136). For experiments. |
+| `smsc95xx.taskpri` | A number from -5 to 19: the priority of the driver's task, instead of 0 (the priority of Roadshow). Above the stack, upload is about half as fast; below it, download suffers and a busy program at priority 0 holds the network up. For experiments. |
 
 ## Status and limits
 
 - Tested on **one** machine: Amiga 1200 + PiStorm32 + Emu68 1.0.7 + Raspberry Pi 3B 1.2. Other
   boards of the BCM2837 family (Pi 3B+, Zero 2 W, CM3) are untested.
 - Tested with Roadshow only. Other SANA-II stacks (Miami, Genesis, ...) are untested.
-- Transmit is the weaker direction: one frame per USB transfer, one transfer at a time.
+- One transmit transfer at a time, on purpose: `dwc2usb.device` does not keep the transfers
+  of one endpoint in order, so two in flight could leave out of order.
+- The driver's task shares the CPU with the programs at priority 0: while one of them
+  computes, the network slows down (as Roadshow itself does), it does not stop.
 - The chip's DMA copy hooks, the SANA-II packet filter hook, the extended statistics and
   `S2_CONNECT` are not implemented; `LastStart` in the global statistics is not set.
-- Hot-unplug of the cable or of the USB device, and restarting Poseidon under load, are
-  not tested thoroughly.
+- Unplugging and plugging back the cable is detected (link down, link up). Hot-unplug of the
+  USB device and restarting Poseidon under load are not tested thoroughly.
 - Only one bulk-in transfer is kept pending on purpose: the DWC2 driver has two bulk
   channels, and a pending IN holds one until the driver takes it back after a 100 ms slice,
   so more would starve transmit and any other USB device behind the same hub.
 
-Ideas for later: queue several transmit transfers, group frames on transmit, measure and
-tune the link poll, test other Pi models and stacks.
+Ideas for later: test the Pi Zero 2 W (with a LAN95xx adapter) and other stacks.
 
 ## Building
 

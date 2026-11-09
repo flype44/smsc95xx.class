@@ -181,7 +181,7 @@ int lan95_chip_init(struct Smsc95xxBinding *b)
     }
     if (!lan95_write_reg(b, LAN95_BURST_CAP, b->multi ? LAN95_BURST_CAP_HS : 0))
         return 7;
-    if (!lan95_write_reg(b, LAN95_BULK_IN_DLY, LAN95_BULK_IN_DLY_DEFAULT))
+    if (!lan95_write_reg(b, LAN95_BULK_IN_DLY, b->bulk_in_dly))
         return 8;
 
     /* 5. Acknowledge any pending interrupt status. */

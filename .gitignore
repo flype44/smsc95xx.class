@@ -6,3 +6,4 @@ install/
 .vscode/
 CLAUDE.local.md
 dist/
+docs/datasheets/

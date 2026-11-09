@@ -45,6 +45,11 @@ supply what is needed and keep integer division on constants.
   verify against a real Poseidon binary (`tools/hunkvec.py`, `docs/ABI-poseidon-4.5.md`).
 - Keep **one** bulk-in transfer pending (see `docs/ARCHITECTURE.md`): more starve the two bulk
   channels of the DWC2 driver.
+- Keep **one** bulk-out transfer in flight, carrying every frame queued meanwhile: the DWC2
+  driver does not keep the transfers of one endpoint in order.
+- The binding task runs at the TCP/IP stack's priority (0) on purpose: above it, every write
+  pre-empts the stack and frames leave one by one (half the upload rate). Measure before
+  changing it (throughput, and the task's CPU share and task switches).
 - Anything that cannot be tested on the real machine is to be said so in the notes and the commit
   message.
 - Do not commit binaries (`build/` is ignored) or secrets.

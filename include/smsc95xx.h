@@ -26,9 +26,20 @@
  * device behind the same hub (a USB stick): every packet would wait for a slice.
  */
 #define LAN95_RX_QUEUE   1
-#define LAN95_BUF_SIZE   2048    /* the TX buffer, and an RX buffer in single-frame mode */
+#define LAN95_BUF_SIZE   2048    /* an RX buffer in single-frame mode */
 #define LAN95_RX_BUF_SIZE 18944  /* multi-frame RX buffer: 16 KiB + 5 * 512 */
 #define LAN95_BURST_CAP_HS 37    /* LAN95_RX_BUF_SIZE / 512, high-speed packets */
+
+/*
+ * Transmit: the frames waiting when the pipe is free leave together, in ONE
+ * bulk-out transfer (the chip always accepts several frames per transfer:
+ * LAN950x data sheet DS00001875D, 5.3.1.2). Still only one transfer in flight:
+ * dwc2usb does not serialise the transfers of one endpoint, so two of them
+ * could leave in the wrong order, or on both bulk channels at once.
+ * LAN95_TX_BATCH_MAX 1 gives back one frame per transfer (version 0.10).
+ */
+#define LAN95_TX_BUF_SIZE  16384
+#define LAN95_TX_BATCH_MAX 16
 
 #define ETH_ALEN         6
 #define ETH_HDR_LEN      14
@@ -107,7 +118,8 @@ struct Smsc95xxUnit {
 
     struct List         openers;
     struct List         writes;     /* CMD_WRITE & co. waiting for the pipe */
-    struct IOSana2Req  *tx_cur;     /* the request on the wire            */
+    struct List         tx_wire;    /* requests in the transfer on the wire
+                                     * (binding task only, not abortable) */
     struct List         events;     /* S2_ONEVENT                         */
     struct List         orphans;    /* S2_READORPHAN                      */
     struct List         types;      /* tracked packet types               */
@@ -157,17 +169,22 @@ struct Smsc95xxBinding {
     UBYTE          *rx_buf[LAN95_RX_QUEUE];
     BOOL            rx_armed[LAN95_RX_QUEUE];
     APTR            tx_pipe;
-    UBYTE          *tx_buf;
+    UBYTE          *tx_buf;     /* LAN95_TX_BUF_SIZE bytes            */
+    ULONG           tx_fill;    /* where the next frame's header goes */
+    ULONG           tx_end;     /* end of the last frame packed       */
+    UWORD           tx_count;   /* frames packed, not yet sent        */
+    UWORD           tx_wire_count; /* frames in the transfer in flight */
     UBYTE          *buffers;    /* one allocation holding all of them */
     BOOL            running;
     BOOL            tx_busy;
     BOOL            multi;      /* several frames per bulk-in transfer */
     BOOL            no_bir;     /* test: do not set "bulk-in empty response" */
+    ULONG           bulk_in_dly; /* BULK_IN_DLY register value        */
     ULONG           rx_len;     /* length of each bulk-in request     */
     ULONG           rx_empty;   /* bulk-in transfers that returned nothing */
 
     ULONG           rx_frames, rx_bytes, rx_errors, rx_err_run;
-    ULONG           tx_frames, tx_errors;
+    ULONG           tx_frames, tx_xfers, tx_errors;
 
     /* timer and link/stat reporting (smsc95xx.class.c) */
     struct MsgPort     *timer_port;
@@ -177,6 +194,7 @@ struct Smsc95xxBinding {
     BOOL            last_up, last_fdx;
     UWORD           last_speed;
     ULONG           ticks;
+    ULONG           link_rx_seen; /* rx_frames at the last link check   */
     ULONG           stat_rx, stat_tx, stat_err;
     ULONG           poll_max_ms, poll_slow_logged;
     ULONG           selftest_ip;
@@ -205,8 +223,9 @@ BOOL lan95_rx_mode(struct Smsc95xxBinding *b, BOOL promisc, BOOL allmulti,
 BOOL data_open(struct Smsc95xxBinding *b);
 void data_start(struct Smsc95xxBinding *b);
 void data_close(struct Smsc95xxBinding *b);
-UBYTE *data_tx_frame(struct Smsc95xxBinding *b);
-BOOL data_tx_commit(struct Smsc95xxBinding *b, ULONG len);
+UBYTE *data_tx_slot(struct Smsc95xxBinding *b);
+BOOL data_tx_add(struct Smsc95xxBinding *b, ULONG len);
+BOOL data_tx_flush(struct Smsc95xxBinding *b);
 BOOL data_send(struct Smsc95xxBinding *b, const UBYTE *frame, ULONG len);
 BOOL data_send_arp_probe(struct Smsc95xxBinding *b, ULONG target_ip);
 BOOL data_pipe_done(struct Smsc95xxBinding *b, APTR pipe);

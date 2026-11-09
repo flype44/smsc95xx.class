@@ -443,56 +443,70 @@ static ULONG build_frame(struct Smsc95xxUnit *u, struct IOSana2Req *r,
     return ETH_HDR_LEN + n;
 }
 
+/*
+ * While the pipe is free, pack every queued write that fits into one bulk-out
+ * transfer, then send it. The requests stay on tx_wire until that transfer
+ * completes (sana_tx_done), and are replied then.
+ */
 void sana_tx_kick(struct Smsc95xxUnit *u)
 {
     struct Smsc95xxBinding *b = u->binding;
+    struct IOSana2Req *r;
+    BOOL packed = FALSE;
 
-    while (b && u->attached && !u->tx_cur) {
-        struct IOSana2Req *r;
+    if (!b || !u->attached)
+        return;
+
+    for (;;) {
         UBYTE *frame;
         ULONG len, wire = 0;
         BYTE err = 0;
+
+        if (!(frame = data_tx_slot(b)))
+            break;                      /* in flight, or the batch is full */
 
         Forbid();
         r = (struct IOSana2Req *)RemHead(&u->writes);
         Permit();
         if (!r)
-            return;
+            break;
 
-        if (!(frame = data_tx_frame(b))) {
-            Forbid();
-            AddHead(&u->writes, &r->ios2_Req.io_Message.mn_Node);
-            Permit();
-            return;                     /* the pipe is busy: try again later */
-        }
         len = build_frame(u, r, frame, &err, &wire);
         if (!len) {
             req_done(r, err, wire);
             unit_event(u, S2EVENT_BUFF | S2EVENT_TX | S2EVENT_ERROR);
             continue;
         }
-        if (!data_tx_commit(b, len)) {
+        if (!data_tx_add(b, len)) {
             req_done(r, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR);
             unit_event(u, S2EVENT_TX | S2EVENT_ERROR);
             continue;
         }
-        u->tx_cur = r;
+        AddTail(&u->tx_wire, &r->ios2_Req.io_Message.mn_Node);
+        packed = TRUE;
+    }
+
+    if (packed && !data_tx_flush(b)) {
+        /* Cannot happen while data_tx_slot() said yes; never leave a request
+         * behind if it does. */
+        while ((r = (struct IOSana2Req *)RemHead(&u->tx_wire)))
+            req_done(r, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR);
+        unit_event(u, S2EVENT_TX | S2EVENT_ERROR);
     }
 }
 
+/* The transfer in flight is done: reply its requests, then send the next
+ * batch. A transfer with no request (the self-test) leaves tx_wire empty. */
 void sana_tx_done(struct Smsc95xxUnit *u, LONG err)
 {
-    struct IOSana2Req *r = u->tx_cur;
+    struct IOSana2Req *r;
     struct TypeStat *ts;
 
-    if (!r)
-        return;                         /* not one of ours (self-test) */
-    u->tx_cur = NULL;
-
-    if (err) {
-        req_done(r, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR);
-        unit_event(u, S2EVENT_TX | S2EVENT_ERROR);
-    } else {
+    while ((r = (struct IOSana2Req *)RemHead(&u->tx_wire))) {
+        if (err) {
+            req_done(r, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR);
+            continue;
+        }
         u->stats.PacketsSent++;
         ts = find_type(u, r->ios2_PacketType);
         if (ts && !(r->ios2_Req.io_Flags & SANA2IOF_RAW)) {
@@ -501,6 +515,8 @@ void sana_tx_done(struct Smsc95xxUnit *u, LONG err)
         }
         req_ok(r);
     }
+    if (err)
+        unit_event(u, S2EVENT_TX | S2EVENT_ERROR);
     sana_tx_kick(u);
 }
 
@@ -946,6 +962,7 @@ struct Smsc95xxUnit *sana_unit_get(struct Smsc95xxDev *dev,
     u->unit.unit_MsgPort.mp_Flags = PA_IGNORE;
     new_list(&u->openers);
     new_list(&u->writes);
+    new_list(&u->tx_wire);
     new_list(&u->events);
     new_list(&u->orphans);
     new_list(&u->types);
@@ -998,11 +1015,11 @@ void sana_unit_detach(struct Smsc95xxUnit *u)
     while ((m = GetMsg(&u->unit.unit_MsgPort)))
         req_done((struct IOSana2Req *)m, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
 
-    if (u->tx_cur) {
-        struct IOSana2Req *r = u->tx_cur;
+    {
+        struct IOSana2Req *r;
 
-        u->tx_cur = NULL;
-        req_done(r, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
+        while ((r = (struct IOSana2Req *)RemHead(&u->tx_wire)))
+            req_done(r, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
     }
     abort_queued(u, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
     for (;;) {
